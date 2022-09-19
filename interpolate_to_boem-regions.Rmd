@@ -1,0 +1,374 @@
+---
+title: "Interpolate to BOEM Regions"
+output: html_document
+date: "2022-09-13"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## GoMex region
+
+```{r}
+librarian::shelf(
+  arcpullr, dplyr, ggplot2, mapview)
+
+dm_server <-"https://services2.arcgis.com/C8EMgrsFcRFL6LrL/ArcGIS/rest/services/"
+lyr <- "DisMAP_Regions_20220516/FeatureServer/0"
+lyr_url <- paste0(dm_server, lyr)
+d_lyr <- get_spatial_layer(lyr_url) # table(d_lyr$OARegion)
+table(d_lyr$OARegion)
+
+regions <- c(
+  gmx = "Gulf of Mexico",
+  nef = "Northeast US Fall",
+  nes = "Northeast US Spring",
+  sef = "Southeast US Fall",
+  ses = "Southeast US Spring",
+  seu = "Southeast US Summer",
+  wca = "West Coast Annual 2003-Present", # "West Coast Annual",
+  wct = "West Coast Triennial 1977-2004") # West Coast Triennial")
+regions_rds <- c(
+  regions[!names(regions) %in% c("wca","wct")],
+  wca = "West Coast Annual",
+  wct = "West Coast Triennial")
+# rgn    <- "gmx"
+# region <- regions[[rgn]]
+
+ply_rgns <- d_lyr %>% 
+  group_by(OARegion) %>% 
+  filter(OARegion %in% regions) %>% 
+  summarize(
+    geometry = st_union(geoms, is_coverage = T) %>% 
+      st_cast("POLYGON")) %>% 
+  st_as_sf(crs = 4326) %>% 
+  mutate(
+    one = 1) %>% 
+  st_make_valid() %>% 
+  st_simplify(dTolerance = 1) # 1 meter
+mapview(ply_rgns)
+
+ply_rgn <- ply_rgns %>% 
+  filter(OARegion == region) %>% 
+
+ply_rgn_mer <- st_transform(ply_rgn, 3857)
+r_rgn_mer   <- raster(ply_rgn_mer, res=2000)
+```
+
+## Data
+
+```{r}
+# libraries ----
+librarian::shelf(
+  # fasterize, htmltools
+  dplyr, glue, here, gstat, leaflet, mapview,
+  purrr, raster, readr, sf, stringr, tibble)
+
+select <- dplyr::select
+options(readr.show_col_types = F)
+
+# functions ----
+basehere <- function(path){
+  str_replace(path, paste0(here(), "/"), "")
+}
+
+get_sp_yr <- function(sp_key, yr){
+  # sp_key="ach-spi1"; yr=2019
+  
+  r_yr_tif <- here(glue("tmp/{brgn}_{sp_key}_{yr}-1yr.tif"))
+  
+  if (!file.exists(r_yr_tif)){
+    
+    pts <- pts_rgn_mer %>% 
+      filter(
+        sp_key  == !!sp_key,
+        year    == !!yr) 
+    
+    if (nrow(pts) == 0){
+      message(glue("    unavailable: {brgn}_{sp_key} for {yr}"))
+      return(NA)
+    }
+    
+    if (nrow(pts %>% filter(wtcpue_cbrt > 0)) == 0){
+      message(glue("    all zeros: {brgn}_{sp_key} for {yr}"))
+      return(NA)
+    }
+    
+    message(glue("    writing: {basehere(r_yr_tif)}"))
+    mdl <- gstat(
+      formula = wtcpue_cbrt ~ 1, locations = pts, 
+      nmin = 10, nmax = 15, maxdist = 200000, set = list(idp = 1))
+    r_yr <- interpolate(r_brgn_mer, mdl) %>% 
+      mask(ply_brgn_mer) # mapview::mapview(r_idw)
+    
+    writeRaster(r_yr, r_yr_tif)
+  }
+  raster(r_yr_tif)
+}
+
+# paths ----
+d_spp_csv     <- here("data_tif/_spp.csv")
+d_spp_rgn_csv <- here("data_tif/_spp_rgn.csv")
+
+# species list ----
+if (any(!file.exists(d_spp_rgn_csv, d_spp_csv))){
+  
+  d_spp_rgn_0_csv <- here("data_clean/spplist.csv")
+  
+  d_spp_rgn <- read_csv(d_spp_rgn_0_csv) %>%
+    rename(
+      sp_sci = spp,
+      sp_cmn = common)
+   
+  # * get unique species key `sp_key` ----
+  sp_sci2key <- function(spp){
+    gs <- str_split(spp, "\\W")[[1]][1:2]
+    g <- str_sub(gs[1], end=3)
+    s <- str_sub(gs[2], end=3)
+    str_to_lower(glue("{g}-{s}"))
+  }
+  
+  d_spp <- d_spp_rgn %>%
+    group_by(sp_sci) %>%
+    summarise(sp_cmn = first(sp_cmn)) %>%
+    arrange(sp_sci, sp_cmn) %>%
+    mutate(
+      sp_key = map_chr(sp_sci, sp_sci2key))
+  
+  sp_keys_dup <- d_spp$sp_key[duplicated(d_spp$sp_key)]
+  
+  d_spp <- bind_rows(
+    d_spp %>%
+      filter(!sp_key %in% sp_keys_dup),
+    d_spp %>%
+      filter(sp_key %in% sp_keys_dup) %>%
+      group_by(sp_key) %>%
+      mutate(
+        i = row_number(),
+        sp_key2 = glue("{sp_key}{i}")) %>%
+      select(
+        sp_sci, sp_cmn, sp_key = sp_key2) ) %>%
+    select(sp_key, sp_sci, sp_cmn) %>%
+    arrange(sp_key, sp_sci)
+  
+  d_spp_rgn <- d_spp_rgn %>%
+    left_join(
+      d_spp %>%
+        select(sp_sci, sp_key),
+      by = "sp_sci")
+    
+  write_csv(d_spp, d_spp_csv)
+  write_csv(d_spp_rgn, d_spp_rgn_csv)
+}
+
+d_spp     <- read_csv(d_spp_csv)
+d_spp_rgn <- read_csv(d_spp_rgn_csv)
+
+# BOEM regions ----
+
+# list.files("data_clean", "dat_exploded.*rds$")
+
+ply_brgns <- read_sf("~/Github/ecoquants/offhab-scripts/data/ply_rgns.geojson") # mapview(ply_brgns)
+ply_brgns_mer <- st_transform(ply_brgns, 3857)
+
+bregions <- c(
+  waor = "Washington/Oregon",       # light green
+  scal = "Southern California",     # dark green
+  natl = "North Atlantic",          # light blue
+  matl = "Mid Atlantic",            # dark blue
+  cgmx = "Central Gulf of Mexico")  # pink
+
+brgn_pal <- RColorBrewer::brewer.pal(
+  length(bregions), "Paired")
+names(brgn_pal) = names(bregions)
+
+brgn2rgns <- list(
+  cgmx = c("gmx"),
+  waor = c("wca"),
+  scal = c("wca"),
+  natl = c("nef","nes"),
+  matl = c("nef","nes","sef","ses","seu"))
+
+# iterate over BOEM regions ----
+for (brgn in names(bregions)){ # brgn = names(bregions)[1] # brgn = "cgmx"
+  bregion <- bregions[[brgn]]
+  message(glue("BOEM REGION: {brgn} ({bregion})"))
+  
+  # get data from all regions
+  stopifnot(brgn %in% names(brgn2rgns))
+  rgns <- brgn2rgns[[brgn]]
+  d_lst <- lapply(
+    rgns, function(rgn){
+      # browser()
+      region_rds <- regions_rds[[rgn]]
+      d <- readRDS(glue("data_clean/dat_exploded{region_rds}.rds")) })
+  d_rgn <- bind_rows(d_lst)
+
+  # rgn    <- "gmx"
+  # region <- regions[[rgn]]
+  
+  pts_rgn <- d_rgn %>% 
+    # tibble() %>% 
+    mutate(
+      year        = as.integer(year),
+      wtcpue_cbrt = wtcpue^(1/3)) %>% # take the cube root
+    rename(
+      sp_sci = spp) %>%
+    left_join(
+      d_spp %>%
+        select(sp_sci, sp_key),
+      by = "sp_sci") %>%
+    st_as_sf(
+      coords = c("lon", "lat"), remove = T, crs = 4326) %>%
+    select(
+      year, sp_key, wtcpue_cbrt)  %>% 
+    filter(!is.na(sp_key)) # gmx nrow: 12,921,639 -> 2,525,473
+   # dropping: region, haulid, common, stratum, stratumarea, depth, wtcpue
+  pts_rgn_mer <- st_transform(pts_rgn, 3857)
+  
+  # brgn <- "cgmx"
+  # bregion <- bregions[[brgn]]
+  ply_brgn_mer <- ply_brgns_mer %>%
+    filter(RESA_summa == bregion)
+  r_brgn_mer <- raster(ply_brgn_mer, res=2000)
+  
+  # iterate over species ----
+  if (!all(regions[rgns] %in% unique(d_spp_rgn$region))){
+    message("WHOAH! why are rgns not found?!")
+  }
+  sp_keys <- d_spp_rgn %>% 
+    filter(
+      !flagged,
+      sp_key != "na-na",
+      region %in% regions[rgns]) %>% 
+    distinct(sp_key) %>% 
+    arrange(sp_key) %>% 
+    pull(sp_key)
+  
+  for (sp_key in sp_keys){ # sp_key = sp_keys[1]
+    
+    d_sp <- d_spp_rgn %>% 
+      filter(
+        region == !!region, 
+        sp_key == !!sp_key)
+    message(glue("SPECIES: {sp_key} ({d_sp$sp_sci}) {d_sp$sp_cmn}"))
+    
+    yrs <- pts_rgn_mer %>% 
+      st_drop_geometry() %>% 
+      tibble() %>% 
+      filter(sp_key == !!sp_key) %>% 
+      arrange(year) %>% 
+      pull(year) %>% 
+      unique()
+    if (length(yrs) == 0){
+      message("  WHOAH! why zero yrs?! SKIPPING")
+      next()
+    }
+    
+    #for (yr in yrs){ # yr = yrs[1]
+    for (yr in max(yrs)){ # yr =  max(yrs)
+      
+      message(glue("  YEAR: {yr}"))
+  
+      r_yrs_tif <- here(glue("data_tif/{brgn}_{sp_key}_{yr}.tif"))
+      
+      if (!file.exists(r_yrs_tif)){
+        message(glue("    TRYING: {basehere(r_yrs_tif)}"))
+        
+        yrs <- (yr-2):(yr+2)
+        wts <- 3 - (abs(yr - yrs)) # 1 2 3 2 1
+        lst <- sapply(
+          yrs, function(yr){
+            get_sp_yr(sp_key, yr) })
+        idx <- !is.na(lst)
+        if (sum(idx) == 0){
+          message("    SKIPPING: no data")
+          next()
+        }
+        message(glue("    WRITING: {basehere(r_yrs_tif)}"))
+        stk <- stack(lst[idx])
+        r_yrs <- raster::weighted.mean(stk, wts[idx], na.rm=F)
+        # mapview(r_yrs)
+        writeRaster(r_yrs, r_yrs_tif)
+      }
+    }
+  }
+}
+```
+
+```{r}
+# plot(r_idw)
+# r_idw <- r_idw^3
+
+# Create a continuous palette function
+pal <- colorNumeric(
+  palette = "viridis",
+  domain = values(r_idw),
+  na.color = "transparent", alpha = T)
+
+leaflet() %>%
+  addProviderTiles(providers$Esri.OceanBasemap) %>% 
+  addRasterImage(
+    r_idw, colors = pal, project = F) %>%
+  addLegend(
+    pal = pal,
+    values = values(r_idw),
+    title = paste0(
+      sp_common, 
+      "<br>∛wtcpue<br>",
+      min(yrs), ":", max(yrs)),
+    opacity = 1)
+```
+
+
+The predicted biomass density (kg per tow) distribution
+based on fishery-independent survey data. The
+distribution surface is created by applying the inverse
+distance weighting (IDW) interpolation algorithm to the
+observations in the survey for each species, regions, and
+season combination. The grid size is 2km x 2 km. The IDW
+approach smooths over multiple observations to
+interpolate the biomass across areas where the survey did
+not sample. For more detailed information on the
+methodology and data sources see the DisMAP 
+
+
+```{r}
+
+
+url <- "https://maps.fisheries.noaa.gov/image/rest/services/DisMAP/Gulf_of_Mexico_20220516/ImageServer"
+
+crs_txt <- 'PROJCS["WGS_1984_Albers_NMSDD",GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Albers"],PARAMETER["false_easting",0.0],PARAMETER["false_northing",0.0],PARAMETER["central_meridian",180.0],PARAMETER["standard_parallel_1",-2.0],PARAMETER["standard_parallel_2",49.0],PARAMETER["latitude_of_origin",25.5],UNIT["Meter",1.0]]'
+crs_alb <- st_crs(crs_txt)
+
+ply_gm_alb <- st_transform(ply_gm, crs_alb)
+
+class(ply_gm_alb)
+
+bb <- paste(sf::st_bbox(ply_gm_alb), collapse =",")
+img <- get_image_layer(url, bbox = bb)
+
+arcpullr:::get_raster_layer
+img
+
+response_raw <- httr::POST(url = url, body = list(f = "json", 
+        token = "", bbox = bb, bboxSR = bbox_sr, 
+        imageSR = bbox_sr, transparent = transparent, format = format, 
+        ...))
+
+sf_obj <- ply_gm_alb
+bbox <- v
+bbox_coords <- paste(bbox, collapse = ", ")
+bbox_sr <- get_sf_crs(sf_obj)
+sf::st_crs(sf_obj)[[1]]
+
+plot_layer(img)
+
+
+
+
+```
+
